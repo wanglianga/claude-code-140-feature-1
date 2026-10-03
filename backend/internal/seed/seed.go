@@ -4,6 +4,7 @@ package seed
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -180,6 +181,12 @@ func Run(ctx context.Context, pool *pgxpool.Pool) error {
 		return err
 	}
 
+	// 10 月雨后顶楼漏水投诉（新装光伏支架位置渗水）：证据齐全、责任一时无法确认，
+	// 已临时止水+住户安抚+委托第三方检测，并暂时冻结相关组件 10 月收益。
+	if err := seedOctoberLeakCase(ctx, tx, b1, property, r1, r2, r3); err != nil {
+		return err
+	}
+
 	// 楼栋 2：处于表决阶段，顶楼住户有漏水担忧
 	var b2 int64
 	if err := tx.QueryRow(ctx, `
@@ -241,7 +248,91 @@ func Run(ctx context.Context, pool *pgxpool.Pool) error {
 	return nil
 }
 
-// seedFinalizeAugust 用结算引擎生成并定稿 2026-08 月度结算，同步写入台账、住户余额与收付款记录。
+// seedOctoberLeakCase 构造 2026-10 雨后顶楼漏水投诉完整链路：
+// 顶楼住户此前已签署同意书 → 工单关联施工照片/防水验收/雨量记录/同意书 →
+// 临时止水、住户安抚、第三方检测已安排（责任一时无法确认）→
+// 暂时冻结相关组件 10 月收益（待结算定稿生效）→ 后续屋顶巡检计划。
+func seedOctoberLeakCase(ctx context.Context, tx pgx.Tx, bid, propertyID, r1, r2, r3 int64) error {
+	// 顶楼住户屋顶使用同意书（施工前签署）
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO rooftop_consents(building_id,user_id,unit_no,signed_at,document_no,note)
+		VALUES ($1,$2,'1-601',$3,'RC-2026-013','顶楼住户同意支架穿层安装，安装商承诺 5 年防水质保')`,
+		bid, r1, time.Date(2026, 2, 20, 0, 0, 0, 0, time.UTC)); err != nil {
+		return err
+	}
+
+	// 雨后渗水投诉工单（责任暂无法确认，先不填费用）
+	var woID int64
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO work_orders(building_id,inverter_id,period_month,title,description,wo_type,
+			responsibility,cost,status,reporter_id,assignee,unit_no,resident_consent_status,
+			temporary_stoppage_at,reassured_at,third_party_test_at,third_party_test_org,third_party_test_note)
+		VALUES ($1,NULL,'2026-10','601 新装支架位置雨后渗水',
+			'10月1日暴雨后，新装光伏支架东侧穿层点顶板出现渗水，沿灯线滴漏。','leak',
+			'undetermined',0,'processing',$2,'防水班组-周工','1-601','signed',
+			now(),now(),now(),$3,$4) RETURNING id`,
+		bid, r1,
+		"市房屋安全检测中心",
+		"已委托对支架穿层封堵与防水卷材搭接做红外+淋水复检，7 个工作日出报告").Scan(&woID); err != nil {
+		return err
+	}
+
+	attach := func(kind, title, detail, recorded string) error {
+		t, _ := time.Parse("2006-01-02", recorded)
+		_, err := tx.Exec(ctx, `
+			INSERT INTO work_order_attachments(work_order_id,building_id,kind,title,url,detail,recorded_at,created_by)
+			VALUES ($1,$2,$3,$4,'',$5,$6,$7)`,
+			woID, bid, kind, title, detail, t, propertyID)
+		return err
+	}
+	if err := attach("onsite_photo", "601 顶板渗水照片", "灯线周边明水，顶板湿渍约 0.4㎡", "2026-10-02"); err != nil {
+		return err
+	}
+	if err := attach("construction_photo", "东侧支架穿层施工照片", "支架立柱化学锚栓穿层，原记录为聚氨酯密封+附加层", "2026-06-15"); err != nil {
+		return err
+	}
+	if err := attach("waterproof_acceptance", "屋顶防水工程验收单", "2026-06-18 四方验收合格，附加层收边完好，质保 5 年", "2026-06-18"); err != nil {
+		return err
+	}
+	if err := attach("rainfall", "10月1日小区雨量记录", "气象站记录日降雨量 86.2mm（大雨量级），为近一年最大降雨", "2026-10-01"); err != nil {
+		return err
+	}
+	if err := attach("consent", "顶楼住户屋顶使用同意书 RC-2026-013", "张伟 2026-02-20 签署，同意支架穿层安装", "2026-02-20"); err != nil {
+		return err
+	}
+
+	// 暂时冻结相关组件 10 月收益（待 10 月结算定稿后生效持有）
+	var fzID int64
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO revenue_freezes(building_id,work_order_id,period_month,scope,freeze_ratio,
+			estimated_cost,status,note,created_by)
+		VALUES ($1,$2,'2026-10','component',100,2000,'pending',
+			'责任未明前冻结涉事支架相关组件收益：张伟100%、李娜50%、王强50%，结论后按责任比例释放',$3)
+		RETURNING id`, bid, woID, propertyID).Scan(&fzID); err != nil {
+		return err
+	}
+	for _, t := range []struct {
+		uid   int64
+		ratio float64
+	}{{r1, 100}, {r2, 50}, {r3, 50}} {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO revenue_freeze_targets(freeze_id,user_id,ratio) VALUES ($1,$2,$3)`,
+			fzID, t.uid, t.ratio); err != nil {
+			return err
+		}
+	}
+
+	// 后续屋顶巡检计划
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO roof_inspections(building_id,work_order_id,title,plan_date,focus,created_by)
+		VALUES ($1,$2,'雨后支架穿层防水复查','2026-11-01',
+			'复查东侧支架穿层封堵、卷材搭接及雨水管口，结合第三方检测报告验收',$3)`,
+		bid, woID, propertyID); err != nil {
+		return err
+	}
+	return nil
+}
+
 func seedFinalizeAugust(ctx context.Context, tx pgx.Tx, bid, propertyID, r1, r2, r3 int64) error {
 	res := settlement.Compute(settlement.Input{
 		BuildingID:  bid,

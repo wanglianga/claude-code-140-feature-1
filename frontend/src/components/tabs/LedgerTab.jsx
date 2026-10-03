@@ -7,6 +7,7 @@ const CAT_LABEL = {
   public: '公共收益', maintenance_fund: '维修基金', repair: '维修支出',
   om: '运维费', tax: '税费', refund: '退款', compensation: '责任赔偿',
   transfer_in: '权益转入',
+  freeze_hold: '漏水冻结', freeze_release: '冻结释放返还',
 }
 
 export default function LedgerTab({ user, building }) {

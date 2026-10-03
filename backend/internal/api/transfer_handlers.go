@@ -59,6 +59,15 @@ func (s *Server) createTransfer(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 409, "仅已缴费的认购可以办理转让/退购，当前状态："+status)
 		return
 	}
+	// 存在漏水投诉期间被暂时冻结、尚未按责任释放的收益时，禁止转让/退购
+	var held int
+	_ = s.Pool.QueryRow(r.Context(),
+		`SELECT count(*) FROM freeze_holds WHERE user_id=$1 AND status IN ('held','partially_released')`,
+		fromID).Scan(&held)
+	if held > 0 {
+		writeErr(w, 409, "该认购尚有顶楼漏水投诉相关的冻结收益未完成责任确认与释放，请待冻结收益处理完毕后再办理转让/退购")
+		return
+	}
 	// 历史收益是否结清：检查是否存在已定稿但金额尚未体现……简化口径：余额已结算即视为结清，
 	// 这里把发起时点是否有未结草稿期作为提示字段（物业确认时再次把关）。
 	var pendingDraft int
@@ -155,6 +164,14 @@ func (s *Server) confirmTransfer(w http.ResponseWriter, r *http.Request) {
 		`SELECT count(*) FROM settlement_periods WHERE building_id=$1 AND status='draft'`, *bid).Scan(&pendingDraft)
 	if pendingDraft > 0 {
 		writeErr(w, 409, "存在未最终定稿的月度结算，历史收益未结清，请先生成/定稿或删除草稿后再办理")
+		return
+	}
+	var held int
+	_ = s.Pool.QueryRow(r.Context(),
+		`SELECT count(*) FROM freeze_holds WHERE user_id=$1 AND status IN ('held','partially_released')`,
+		*fromID).Scan(&held)
+	if held > 0 {
+		writeErr(w, 409, "该认购尚有漏水投诉相关的冻结收益未释放，请先完成责任确认与收益释放")
 		return
 	}
 

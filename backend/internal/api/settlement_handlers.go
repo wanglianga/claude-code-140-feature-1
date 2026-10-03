@@ -90,10 +90,15 @@ func (s *Server) createSettlement(w http.ResponseWriter, r *http.Request) {
 		shares = append(shares, sh)
 	}
 
-	// 当期工单：费用 >0 且责任已判定的才进入结算
+	// 当期工单：费用 >0 且责任已判定的才进入结算；
+	// 已建立收益冻结单的漏水工单不在此处直接分摊，其费用待责任确认后随冻结释放入账。
 	woRows, err := s.Pool.Query(r.Context(), `
-		SELECT id, title, cost, responsibility FROM work_orders
-		WHERE building_id=$1 AND period_month=$2 AND cost > 0 AND responsibility <> 'undetermined'`,
+		SELECT w.id, w.title, w.cost, w.responsibility, COALESCE(w.responsibility_allocation::text,'[]')
+		FROM work_orders w
+		WHERE w.building_id=$1 AND w.period_month=$2 AND w.cost > 0 AND w.responsibility <> 'undetermined'
+		  AND NOT EXISTS (
+			SELECT 1 FROM revenue_freezes f
+			WHERE f.work_order_id=w.id AND f.period_month=w.period_month AND f.status<>'cancelled')`,
 		bid, in.PeriodMonth)
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -103,12 +108,49 @@ func (s *Server) createSettlement(w http.ResponseWriter, r *http.Request) {
 	var wos []settlement.WorkOrder
 	for woRows.Next() {
 		var wo settlement.WorkOrder
-		if err := woRows.Scan(&wo.ID, &wo.Title, &wo.Cost, &wo.Responsibility); err != nil {
+		var allocJSON string
+		if err := woRows.Scan(&wo.ID, &wo.Title, &wo.Cost, &wo.Responsibility, &allocJSON); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}
+		if wo.Responsibility == "shared" {
+			var allocs []struct {
+				Bearer string  `json:"bearer"`
+				Ratio  float64 `json:"ratio"`
+			}
+			_ = json.Unmarshal([]byte(allocJSON), &allocs)
+			for _, a := range allocs {
+				if a.Bearer == "installer" || a.Bearer == "insurance" {
+					wo.ClaimRatio += a.Ratio
+				} else {
+					wo.SelfRatio += a.Ratio
+				}
+			}
+		}
 		wos = append(wos, wo)
 	}
+
+	// 当期待生效的收益冻结：维修期间相关组件/公共部分收益按比例暂时冻结
+	fzRows, err := s.Pool.Query(r.Context(), `
+		SELECT COALESCE(t.user_id,0), t.ratio
+		FROM revenue_freezes f JOIN revenue_freeze_targets t ON t.freeze_id=f.id
+		WHERE f.building_id=$1 AND f.period_month=$2 AND f.status='pending'`,
+		bid, in.PeriodMonth)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	var freezes []settlement.FreezeTarget
+	for fzRows.Next() {
+		var fz settlement.FreezeTarget
+		if err := fzRows.Scan(&fz.UserID, &fz.Ratio); err != nil {
+			fzRows.Close()
+			writeErr(w, 500, err.Error())
+			return
+		}
+		freezes = append(freezes, fz)
+	}
+	fzRows.Close()
 
 	if in.FundRatio <= 0 {
 		var ruleJSON string
@@ -136,6 +178,7 @@ func (s *Server) createSettlement(w http.ResponseWriter, r *http.Request) {
 		Compensation: in.Compensation,
 		Shareholders: shares,
 		WorkOrders:   wos,
+		Freezes:      freezes,
 	})
 
 	var periodID int64
@@ -149,8 +192,8 @@ func (s *Server) createSettlement(w http.ResponseWriter, r *http.Request) {
 		INSERT INTO settlement_periods(building_id,period_month,total_kwh,grid_price,subsidy_per_kwh,
 			gross_revenue,total_subsidy,om_fee,tax,work_order_cost,maintenance_fund_ratio,
 			maintenance_fund_used,maintenance_fund_addition,compensation,public_ratio,
-			distributable,created_by)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+			distributable,frozen_total,payable_total,created_by)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
 		ON CONFLICT (building_id,period_month) DO UPDATE SET
 			total_kwh=EXCLUDED.total_kwh, grid_price=EXCLUDED.grid_price,
 			subsidy_per_kwh=EXCLUDED.subsidy_per_kwh, gross_revenue=EXCLUDED.gross_revenue,
@@ -159,12 +202,13 @@ func (s *Server) createSettlement(w http.ResponseWriter, r *http.Request) {
 			maintenance_fund_used=EXCLUDED.maintenance_fund_used,
 			maintenance_fund_addition=EXCLUDED.maintenance_fund_addition,
 			compensation=EXCLUDED.compensation,
-			public_ratio=EXCLUDED.public_ratio, distributable=EXCLUDED.distributable
+			public_ratio=EXCLUDED.public_ratio, distributable=EXCLUDED.distributable,
+			frozen_total=EXCLUDED.frozen_total, payable_total=EXCLUDED.payable_total
 		RETURNING id`,
 		bid, in.PeriodMonth, res.TotalKwh, in.GridPrice, in.SubsidyRate,
 		res.GrossRevenue, res.TotalSubsidy, res.OmFee, res.Tax, res.WorkOrderCost,
 		in.FundRatio, res.FundUsed, res.FundAddition, res.Compensation, res.PublicRatio,
-		res.Distributable, u.ID).Scan(&periodID)
+		res.Distributable, res.FrozenTotal, res.PayableTotal, u.ID).Scan(&periodID)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -175,10 +219,10 @@ func (s *Server) createSettlement(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, it := range res.Items {
 		if _, err := tx.Exec(r.Context(), `
-			INSERT INTO settlement_items(period_id,user_id,item_type,ratio,kwh,revenue,subsidy,om_share,tax_share,wo_share,amount,memo)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+			INSERT INTO settlement_items(period_id,user_id,item_type,ratio,kwh,revenue,subsidy,om_share,tax_share,wo_share,amount,frozen_amount,memo)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
 			periodID, it.UserID, it.ItemType, it.Ratio, it.Kwh, it.Revenue, it.Subsidy,
-			it.OmShare, it.TaxShare, it.WoShare, it.Amount, it.Memo); err != nil {
+			it.OmShare, it.TaxShare, it.WoShare, it.Amount, it.Frozen, it.Memo); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}
@@ -199,7 +243,8 @@ func (s *Server) listSettlements(w http.ResponseWriter, r *http.Request) {
 		SELECT id, period_month, status, total_kwh, grid_price, subsidy_per_kwh,
 			gross_revenue, total_subsidy, om_fee, tax, work_order_cost,
 			maintenance_fund_ratio, maintenance_fund_used, maintenance_fund_addition,
-			compensation, public_ratio, distributable, created_at, finalized_at
+			compensation, public_ratio, distributable, frozen_total, payable_total,
+			created_at, finalized_at
 		FROM settlement_periods WHERE building_id=$1 ORDER BY period_month DESC`, bid)
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -211,11 +256,11 @@ func (s *Server) listSettlements(w http.ResponseWriter, r *http.Request) {
 		var id int64
 		var month, status string
 		var kwh, price, subsidy, gross, totalSub, om, tax, woCost float64
-		var fundRatio, fundUsed, fundAdd, comp, pubRatio, dist float64
+		var fundRatio, fundUsed, fundAdd, comp, pubRatio, dist, frozen, payable float64
 		var createdAt, finalizedAt any
 		if err := rows.Scan(&id, &month, &status, &kwh, &price, &subsidy, &gross, &totalSub,
 			&om, &tax, &woCost, &fundRatio, &fundUsed, &fundAdd, &comp, &pubRatio, &dist,
-			&createdAt, &finalizedAt); err != nil {
+			&frozen, &payable, &createdAt, &finalizedAt); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}
@@ -226,7 +271,8 @@ func (s *Server) listSettlements(w http.ResponseWriter, r *http.Request) {
 			"maintenance_fund_ratio": fundRatio, "maintenance_fund_used": fundUsed,
 			"maintenance_fund_addition": fundAdd, "compensation": comp,
 			"public_ratio":  pubRatio,
-			"distributable": dist, "created_at": createdAt, "finalized_at": finalizedAt,
+			"distributable": dist, "frozen_total": frozen, "payable_total": payable,
+			"created_at": createdAt, "finalized_at": finalizedAt,
 		})
 	}
 	writeJSON(w, 200, map[string]any{"items": out})
@@ -239,17 +285,18 @@ func (s *Server) getSettlement(w http.ResponseWriter, r *http.Request) {
 	sid := urlID(r, "sid")
 	var bid int64
 	var month, status string
-	var kwh, price, subRate, gross, totalSub, om, tax, woCost, fundRatio, pubRatio, dist float64
+	var kwh, price, subRate, gross, totalSub, om, tax, woCost, fundRatio, pubRatio, dist, frozen, payable float64
 	var fundUsed, fundAdd, compAmt float64
 	var finalizedAt any
 	err := s.Pool.QueryRow(r.Context(), `
 		SELECT building_id, period_month, status, total_kwh, grid_price, subsidy_per_kwh,
 			gross_revenue, total_subsidy, om_fee, tax, work_order_cost,
 			maintenance_fund_ratio, maintenance_fund_used, maintenance_fund_addition,
-			compensation, public_ratio, distributable, finalized_at
+			compensation, public_ratio, distributable, frozen_total, payable_total, finalized_at
 		FROM settlement_periods WHERE id=$1`, sid).
 		Scan(&bid, &month, &status, &kwh, &price, &subRate, &gross, &totalSub,
-			&om, &tax, &woCost, &fundRatio, &fundUsed, &fundAdd, &compAmt, &pubRatio, &dist, &finalizedAt)
+			&om, &tax, &woCost, &fundRatio, &fundUsed, &fundAdd, &compAmt, &pubRatio, &dist,
+			&frozen, &payable, &finalizedAt)
 	if isNoRows(err) {
 		writeErr(w, 404, "结算单不存在")
 		return
@@ -260,7 +307,7 @@ func (s *Server) getSettlement(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.Pool.Query(r.Context(), `
 		SELECT si.id, COALESCE(si.user_id,0), COALESCE(u.name,'公共账户'), si.item_type,
 			si.ratio, si.kwh, si.revenue, si.subsidy, si.om_share, si.tax_share, si.wo_share,
-			si.amount, COALESCE(si.memo,'')
+			si.amount, si.frozen_amount, si.released_amount, COALESCE(si.memo,'')
 		FROM settlement_items si LEFT JOIN users u ON u.id=si.user_id
 		WHERE si.period_id=$1
 		ORDER BY CASE si.item_type WHEN 'shareholder' THEN 1 WHEN 'public' THEN 2 ELSE 3 END, si.id`, sid)
@@ -273,16 +320,18 @@ func (s *Server) getSettlement(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var id, uid int64
 		var name, itype, memo string
-		var ratio, ikwh, rev, sub, omS, taxS, woS, amount float64
+		var ratio, ikwh, rev, sub, omS, taxS, woS, amount, frz, released float64
 		if err := rows.Scan(&id, &uid, &name, &itype, &ratio, &ikwh, &rev, &sub,
-			&omS, &taxS, &woS, &amount, &memo); err != nil {
+			&omS, &taxS, &woS, &amount, &frz, &released, &memo); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}
 		items = append(items, map[string]any{
 			"id": id, "user_id": uid, "name": name, "item_type": itype,
 			"ratio": ratio, "kwh": ikwh, "revenue": rev, "subsidy": sub,
-			"om_share": omS, "tax_share": taxS, "wo_share": woS, "amount": amount, "memo": memo,
+			"om_share": omS, "tax_share": taxS, "wo_share": woS, "amount": amount,
+			"frozen_amount": frz, "released_amount": released,
+			"payable_amount": round2(amount - frz + released), "memo": memo,
 		})
 	}
 	writeJSON(w, 200, map[string]any{
@@ -292,8 +341,10 @@ func (s *Server) getSettlement(w http.ResponseWriter, r *http.Request) {
 		"work_order_cost": woCost, "maintenance_fund_ratio": fundRatio,
 		"maintenance_fund_used": fundUsed, "maintenance_fund_addition": fundAdd,
 		"compensation": compAmt,
-		"public_ratio": pubRatio, "distributable": dist, "finalized_at": finalizedAt,
-		"items": items,
+		"public_ratio": pubRatio, "distributable": dist,
+		"frozen_total": frozen, "payable_total": payable,
+		"finalized_at": finalizedAt,
+		"items":        items,
 	})
 }
 
@@ -325,6 +376,7 @@ func (s *Server) finalizeSettlement(w http.ResponseWriter, r *http.Request) {
 	defer tx.Rollback(r.Context())
 
 	type itemRow struct {
+		ID      int64
 		UserID  *int64
 		Type    string
 		Ratio   float64
@@ -335,9 +387,10 @@ func (s *Server) finalizeSettlement(w http.ResponseWriter, r *http.Request) {
 		Tax     float64
 		Wo      float64
 		Amount  float64
+		Frozen  float64
 	}
 	rows, err := tx.Query(r.Context(),
-		`SELECT user_id,item_type,ratio,kwh,revenue,subsidy,om_share,tax_share,wo_share,amount
+		`SELECT id, user_id,item_type,ratio,kwh,revenue,subsidy,om_share,tax_share,wo_share,amount,frozen_amount
 		 FROM settlement_items WHERE period_id=$1`, sid)
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -346,8 +399,8 @@ func (s *Server) finalizeSettlement(w http.ResponseWriter, r *http.Request) {
 	var items []itemRow
 	for rows.Next() {
 		var it itemRow
-		if err := rows.Scan(&it.UserID, &it.Type, &it.Ratio, &it.Kwh, &it.Revenue,
-			&it.Subsidy, &it.Om, &it.Tax, &it.Wo, &it.Amount); err != nil {
+		if err := rows.Scan(&it.ID, &it.UserID, &it.Type, &it.Ratio, &it.Kwh, &it.Revenue,
+			&it.Subsidy, &it.Om, &it.Tax, &it.Wo, &it.Amount, &it.Frozen); err != nil {
 			rows.Close()
 			writeErr(w, 500, err.Error())
 			return
@@ -407,16 +460,31 @@ func (s *Server) finalizeSettlement(w http.ResponseWriter, r *http.Request) {
 			led(uid, "out", "om", it.Om, month+" 运维费分摊")
 			led(uid, "out", "tax", it.Tax, month+" 税费分摊")
 			led(uid, "out", "repair", it.Wo, month+" 维修费分摊（基金不足部分）")
+			// 漏水责任确认前，相关组件收益只入账未冻结部分，冻结部分待责任确认后按比例释放
+			payable := it.Amount - it.Frozen
 			if _, err := tx.Exec(r.Context(),
-				`UPDATE users SET balance=balance+$2 WHERE id=$1`, uid, it.Amount); err != nil {
+				`UPDATE users SET balance=balance+$2 WHERE id=$1`, uid, payable); err != nil {
 				writeErr(w, 500, err.Error())
 				return
+			}
+			if it.Frozen > 0 {
+				led(uid, "out", "freeze_hold", it.Frozen, month+" 顶楼漏水投诉期间暂时冻结收益（待责任确认）")
 			}
 		case "maintenance_fund":
 			// 专款标记：计提/动用（不影响公共账户现金净额）
 			led(nil, "in", "maintenance_fund", fundAddition, month+" 公共收益计提维修基金（专款标记）")
 			led(nil, "out", "maintenance_fund", fundUsed, month+" 动用维修基金支付维修（专款标记）")
 		}
+	}
+
+	// 建立冻结持有记录并激活冻结单：把按比例冻结的金额挂到对应 freeze target 上
+	fItems := make([]finalizeItem, 0, len(items))
+	for _, it := range items {
+		fItems = append(fItems, finalizeItem{ID: it.ID, UserID: it.UserID, Type: it.Type, Amount: it.Amount, Frozen: it.Frozen})
+	}
+	if err := s.activateFreezes(r, tx, bid, month, sid, fItems); err != nil {
+		writeErr(w, 500, err.Error())
+		return
 	}
 
 	if _, err := tx.Exec(r.Context(),
@@ -558,6 +626,13 @@ func (s *Server) buildingDashboard(w http.ResponseWriter, r *http.Request) {
 		`SELECT count(*) FILTER (WHERE status<>'resolved'), count(*) FILTER (WHERE status='resolved')
 		 FROM work_orders WHERE building_id=$1`, bid).Scan(&woOpen, &woResolved)
 
+	// 漏水投诉期间仍被持有、尚未按责任释放的冻结收益（partially_released 为已处理终态，不计入）
+	var frozenHeld float64
+	_ = s.Pool.QueryRow(r.Context(),
+		`SELECT COALESCE(SUM(amount),0)
+		 FROM freeze_holds WHERE building_id=$1 AND status='held'`,
+		bid).Scan(&frozenHeld)
+
 	rows, err := s.Pool.Query(r.Context(), `
 		SELECT period_month, total_kwh, gross_revenue, total_subsidy, distributable, status
 		FROM settlement_periods WHERE building_id=$1 ORDER BY period_month`, bid)
@@ -594,6 +669,7 @@ func (s *Server) buildingDashboard(w http.ResponseWriter, r *http.Request) {
 	d["resident_count"] = residentCount
 	d["work_orders_open"] = woOpen
 	d["work_orders_resolved"] = woResolved
+	d["revenue_frozen"] = frozenHeld
 	d["monthly_series"] = series
 	writeJSON(w, 200, d)
 }

@@ -84,8 +84,17 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, map[string]any{
 		"id": u.ID, "name": u.Name, "role": u.Role, "unit_no": u.UnitNo,
-		"phone": phone, "balance": balance,
+		"phone": phone, "balance": balance, "frozen_held": s.frozenHeldFor(r, u.ID),
 	})
+}
+
+// frozenHeldFor 返回用户当前仍被持有、未按责任释放的漏水冻结收益
+func (s *Server) frozenHeldFor(r *http.Request, uid int64) float64 {
+	var held float64
+	_ = s.Pool.QueryRow(r.Context(),
+		`SELECT COALESCE(SUM(amount),0) FROM freeze_holds
+		 WHERE user_id=$1 AND status='held'`, uid).Scan(&held)
+	return held
 }
 
 func (s *Server) listUsers(w http.ResponseWriter, r *http.Request) {

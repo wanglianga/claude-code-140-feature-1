@@ -116,3 +116,61 @@ func TestPublicOnlyRatio(t *testing.T) {
 		t.Fatalf("金额错误 gross=%v dist=%v", res.GrossRevenue, res.Distributable)
 	}
 }
+
+func TestSharedResponsibility(t *testing.T) {
+	// 漏水责任多方分担：施工方赔偿 40%，项目侧（基金/公共/业主）自担 60%
+	in := Input{
+		TotalKwh: 1000, GridPrice: 0.4,
+		FundBalance:  0,
+		Shareholders: []Share{{UserID: 1, Ratio: 100}},
+		WorkOrders: []WorkOrder{{
+			ID: 1, Title: "漏水", Cost: 1000, Responsibility: "shared",
+			SelfRatio: 60, ClaimRatio: 40,
+		}},
+	}
+	res := Compute(in)
+	if !approx(res.WorkOrderCost, 600) {
+		t.Fatalf("自担维修成本应 600, got %v", res.WorkOrderCost)
+	}
+	if !approx(res.WorkOrderClaim, 400) || !approx(res.Compensation, 400) {
+		t.Fatalf("施工方赔偿应 400: claim=%v comp=%v", res.WorkOrderClaim, res.Compensation)
+	}
+	// 项目侧 600 无基金 → 全额按组件比例分摊
+	if !approx(res.Items[0].WoShare, 600) {
+		t.Fatalf("维修分摊应 600, got %v", res.Items[0].WoShare)
+	}
+}
+
+func TestRevenueFreeze(t *testing.T) {
+	// 2000kWh×0.4=800 电费 + 100 补贴：住户（70%）应得 630，公共（30%）270
+	in := Input{
+		TotalKwh: 2000, GridPrice: 0.4, SubsidyRate: 0.05, FundRatio: 20,
+		Shareholders: []Share{
+			{UserID: 1, Name: "丁", Ratio: 40},
+			{UserID: 2, Name: "戊", Ratio: 30},
+		},
+		Freezes: []FreezeTarget{
+			{UserID: 1, Ratio: 100}, // 丁全额冻结
+			{UserID: 2, Ratio: 50},  // 戊冻结一半
+		},
+	}
+	res := Compute(in)
+	var item1, item2 *Item
+	for i := range res.Items {
+		if res.Items[i].UserID != nil && *res.Items[i].UserID == 1 {
+			item1 = &res.Items[i]
+		}
+		if res.Items[i].UserID != nil && *res.Items[i].UserID == 2 {
+			item2 = &res.Items[i]
+		}
+	}
+	if !approx(item1.Amount, 360) || !approx(item1.Frozen, 360) || item1.Payable != 0 {
+		t.Fatalf("丁应冻结 360: %+v", item1)
+	}
+	if !approx(item2.Amount, 270) || !approx(item2.Frozen, 135) || !approx(item2.Payable, 135) {
+		t.Fatalf("戊应冻结 135、实发 135: %+v", item2)
+	}
+	if !approx(res.FrozenTotal, 495) {
+		t.Fatalf("冻结总额应 495, got %v", res.FrozenTotal)
+	}
+}

@@ -75,7 +75,7 @@ export default function SettlementTab({ user, building }) {
             <tr>
               <th>月份</th><th>状态</th><th className="num">发电量</th><th className="num">电费收入</th>
               <th className="num">补贴</th><th className="num">运维</th><th className="num">税费</th>
-              <th className="num">维修支出</th><th className="num">可分配净额</th><th></th>
+              <th className="num">维修支出</th><th className="num">冻结中</th><th className="num">可分配净额</th><th></th>
             </tr>
           </thead>
           <tbody>
@@ -89,6 +89,7 @@ export default function SettlementTab({ user, building }) {
                 <td className="num">{fmtMoney(p.om_fee)}</td>
                 <td className="num">{fmtMoney(p.tax)}</td>
                 <td className="num">{fmtMoney(p.work_order_cost)}</td>
+                <td className="num">{Number(p.frozen_total) > 0 ? <span className="badge amber">{fmtMoney(p.frozen_total)}</span> : '—'}</td>
                 <td className="num"><b>{fmtMoney(p.distributable)}</b></td>
                 <td><button className="sm" onClick={() => openDetail(p.id)}>查看明细</button></td>
               </tr>
@@ -112,13 +113,23 @@ export default function SettlementTab({ user, building }) {
               动用 ¥{fmtMoney(detail.maintenance_fund_used)}）
             </dd>
             <dt>责任赔偿</dt><dd>¥{fmtMoney(detail.compensation)}（安装商/保险责任，不冲减住户收益）</dd>
+            {Number(detail.frozen_total) > 0 && (
+              <>
+                <dt>漏水冻结</dt>
+                <dd>
+                  本期暂时冻结 <b style={{ color: 'var(--amber)' }}>¥{fmtMoney(detail.frozen_total)}</b>，
+                  实际入账 ¥{fmtMoney(detail.payable_total)}；冻结收益待责任确认后在「漏水处置/收益冻结」页按比例释放。
+                </dd>
+              </>
+            )}
           </dl>
           <table>
             <thead>
               <tr>
                 <th>分配对象</th><th>类型</th><th className="num">占比</th><th className="num">电量</th>
                 <th className="num">电费</th><th className="num">补贴</th><th className="num">运维分摊</th>
-                <th className="num">税分摊</th><th className="num">维修分摊</th><th className="num">分得金额</th>
+                <th className="num">税分摊</th><th className="num">维修分摊</th>
+                <th className="num">应分得</th><th className="num">冻结</th><th className="num">实入账</th>
               </tr>
             </thead>
             <tbody>
@@ -134,6 +145,8 @@ export default function SettlementTab({ user, building }) {
                   <td className="num">{fmtMoney(it.tax_share)}</td>
                   <td className="num">{fmtMoney(it.wo_share)}</td>
                   <td className="num"><b>{fmtMoney(it.amount)}</b></td>
+                  <td className="num">{Number(it.frozen_amount) > 0 ? <span className="badge amber">{fmtMoney(it.frozen_amount)}</span> : '—'}</td>
+                  <td className="num">{fmtMoney(it.payable_amount)}</td>
                 </tr>
               ))}
             </tbody>

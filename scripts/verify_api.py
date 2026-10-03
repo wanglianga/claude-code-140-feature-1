@@ -158,6 +158,76 @@ def main():
                  {"to_stage": "construction", "reason": "设备供应延迟，组件到货推迟"})
     check("有原因回退成功", st == 200, str(r))
 
+    # H. 顶楼漏水投诉与收益冻结（种子工单 + 10 月结算定稿时自动生效的冻结单）
+    st, wlist = call("GET", f"/api/buildings/{bid}/work-orders", prop)
+    leak = next((w for w in wlist["items"]
+                 if w["period_month"] == "2026-10" and "支架" in w["title"]), None)
+    check("找到10月新装支架漏水工单", leak is not None)
+    lwid = leak["id"]
+    check("工单识别顶楼住户已签署同意", leak["resident_consent_status"] == "signed", leak["resident_consent_status"])
+    check("已临时止水/安抚/第三方检测",
+          leak["temporary_stoppage"] and leak["reassured"] and leak["third_party_tested"], str(leak))
+    check("工单关联5条证据(照片/施工/验收/雨量/同意书)", leak["attachment_count"] == 5, str(leak["attachment_count"]))
+    st, atts = call("GET", f"/api/work-orders/{lwid}/attachments", prop)
+    kinds = {a["kind"] for a in atts["items"]}
+    check("证据类型齐全", {"onsite_photo", "construction_photo", "waterproof_acceptance", "rainfall", "consent"} <= kinds, str(kinds))
+    st, cs = call("GET", f"/api/buildings/{bid}/consents", prop)
+    check("顶楼同意书可查(RC-2026-013)", any(c["document_no"] == "RC-2026-013" for c in cs["items"]), str(cs["items"]))
+
+    # 10 月结算定稿后冻结单生效：张伟份额已转让给刘洋→其目标持有 0；李娜冻50%、王强冻50%
+    st, fl = call("GET", f"/api/buildings/{bid}/freezes", prop)
+    fz = next((f for f in fl["items"] if f["period_month"] == "2026-10" and f["work_order_id"] == lwid), None)
+    check("10月冻结单已随结算定稿生效", fz is not None and fz["status"] == "active", str(fz and fz["status"]))
+    tf = {t["name"]: t for t in fz["targets"]}
+    frozen_li = tf["李娜"]["frozen_amount"]
+    frozen_wang = tf["王强"]["frozen_amount"]
+    check("李娜冻结≈139.59(279.18的50%)", approx(frozen_li, 139.59, 0.02), str(frozen_li))
+    check("王强冻结≈83.76(167.51的50%)", approx(frozen_wang, 83.76, 0.02), str(frozen_wang))
+    total_frozen = frozen_li + frozen_wang
+    fid = fz["id"]
+
+    # 责任确认前发起新的冻结单可取消；责任未定时不能释放未生效单
+    st, w2 = call("POST", f"/api/buildings/{bid}/work-orders", prop,
+                  {"period_month": "2026-11", "title": "脚本验证漏水工单", "wo_type": "leak"})
+    check("新建11月漏水工单", st == 201, str(w2))
+    st, f2 = call("POST", f"/api/buildings/{bid}/freezes", prop,
+                  {"work_order_id": w2["id"], "period_month": "2026-11",
+                   "targets": [{"user_id": liu_id, "ratio": 100}]})
+    check("创建待生效冻结单", st == 201, str(f2))
+    st, _ = call("POST", f"/api/freezes/{f2['id']}/cancel", prop)
+    check("待生效冻结单可取消", st == 200, str(st))
+
+    # 按责任比例释放：施工方 50% / 运维基金 50%（基金不足部分公共收益兜底），尾差业主自负
+    st, lg0 = call("GET", f"/api/buildings/{bid}/ledger", prop)
+    fund_before = float(lg0["maintenance_fund_balance"])
+    st, users = call("GET", "/api/users?q=13900000002", prop)
+    li_before = float(next(u["balance"] for u in users["items"] if u["phone"] == "13900000002"))
+    st, rel = call("POST", f"/api/freezes/{fid}/release", prop, {
+        "note": "第三方检测：安装密封缺陷与原防水搭接各占一半",
+        "allocation": [{"bearer": "installer", "ratio": 50}, {"bearer": "fund", "ratio": 50}],
+    })
+    check("冻结收益按责任比例释放", st == 200, str(rel))
+    check("释放总额=冻结总额", approx(rel["total_frozen"], total_frozen, 0.02), str(rel))
+    check("施工方赔付≈一半", approx(rel["installer"], total_frozen / 2, 0.03), str(rel))
+    check("维修基金动用≤基金余额", rel["fund"] <= fund_before + 0.01, str(rel))
+    check("基金不足部分公共收益兜底", rel["fund_shortfall"] > 0, str(rel))
+    check("业主仅承担舍入尾差(≤0.02)", rel["owner"] <= 0.02, str(rel))
+    st, fl = call("GET", f"/api/buildings/{bid}/freezes", prop)
+    fz = next(f for f in fl["items"] if f["id"] == fid)
+    check("冻结单状态=已释放", fz["status"] == "released", fz["status"])
+    st, users = call("GET", "/api/users?q=13900000002", prop)
+    li_after = float(next(u["balance"] for u in users["items"] if u["phone"] == "13900000002"))
+    check("李娜拿回冻结收益(扣尾差)", approx(li_after - li_before, frozen_li, 0.03), f"{li_before}->{li_after}")
+    st, wlist = call("GET", f"/api/buildings/{bid}/work-orders", prop)
+    leak = next(w for w in wlist["items"] if w["id"] == lwid)
+    check("工单责任回写多方分担(shared)", leak["responsibility"] == "shared", leak["responsibility"])
+    st, ins = call("GET", f"/api/buildings/{bid}/roof-inspections", prop)
+    follow = next((i for i in ins["items"] if i["work_order_id"] == lwid), None)
+    check("处理结论写入后续屋顶巡检计划", follow is not None and follow["status"] == "scheduled", str(follow))
+    st, _ = call("POST", f"/api/roof-inspections/{follow['id']}/complete", prop,
+                 {"result_note": "支架穿层封堵完好，雨后复查无复漏"})
+    check("登记屋顶巡检结果", st == 200, str(st))
+
     print("\n全部端到端断言通过 ✅")
 
 

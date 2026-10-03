@@ -30,13 +30,13 @@ export async function handleErr(promise, notify) {
 // ---------- Badges ----------
 const STATUS_STYLE = {
   // stage
-  draft: 'gray', voting: 'amber', subscribing: 'blue', construction: 'amber',
+  draft: 'amber', voting: 'amber', subscribing: 'blue', construction: 'amber',
   grid_acceptance: 'blue', operating: 'green',
   // generic
   paid: 'green', pending: 'amber', refunded: 'red', transferred: 'blue',
   open: 'amber', closed: 'gray', resolved: 'green', processing: 'blue',
   approved: 'green', rejected: 'red',
-  finalized: 'green', draft: 'amber',
+  finalized: 'green',
   normal: 'green', faulty: 'red', maintenance: 'amber',
   explained: 'green',
   shareholder: 'blue', public_only: 'gray',

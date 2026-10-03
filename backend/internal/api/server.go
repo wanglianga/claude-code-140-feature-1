@@ -78,6 +78,24 @@ func (s *Server) Router() http.Handler {
 		r.Post("/buildings/{id}/work-orders", s.createWorkOrder)
 		r.Post("/work-orders/{wid}", s.updateWorkOrder)
 
+		// 顶楼漏水处置：证据、临时止水/安抚/第三方检测/结论、同意书
+		r.Get("/work-orders/{wid}/attachments", s.listAttachments)
+		r.Post("/work-orders/{wid}/attachments", s.attachWorkOrder)
+		r.Post("/work-orders/{wid}/leak-action", s.leakAction)
+		r.Get("/buildings/{id}/consents", s.listConsents)
+		r.Post("/buildings/{id}/consents", s.createConsent)
+
+		// 收益冻结与释放
+		r.Get("/buildings/{id}/freezes", s.listFreezes)
+		r.Post("/buildings/{id}/freezes", s.createFreeze)
+		r.Post("/freezes/{fid}/cancel", s.cancelFreeze)
+		r.Post("/freezes/{fid}/release", s.releaseFreeze)
+
+		// 后续屋顶巡检计划
+		r.Get("/buildings/{id}/roof-inspections", s.listInspections)
+		r.Post("/buildings/{id}/roof-inspections", s.createInspection)
+		r.Post("/roof-inspections/{iid}/complete", s.completeInspection)
+
 		// 结算与台账
 		r.Get("/buildings/{id}/settlements", s.listSettlements)
 		r.Post("/buildings/{id}/settlements", s.createSettlement)

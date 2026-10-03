@@ -61,6 +61,16 @@ export default function OverviewTab({ user, building, dash, reload }) {
         </div>
       </div>
 
+      {Number(dash?.revenue_frozen || 0) > 0 && (
+        <div className="card" style={{ borderColor: 'var(--amber)' }}>
+          <b>顶楼漏水投诉期间冻结收益：¥{fmtMoney(dash?.revenue_frozen)}</b>
+          <div className="small muted" style={{ marginTop: 4 }}>
+            相关组件收益已暂时冻结，待第三方检测与责任确认后，在「漏水处置/收益冻结」页
+            按施工方赔付 / 运维基金 / 楼栋公共收益 / 业主自负的比例释放。
+          </div>
+        </div>
+      )}
+
       <div className="card">
         <div className="card-title"><h2>月度收益走势（定稿月份）</h2></div>
         <RevenueChart series={dash?.monthly_series || []} />

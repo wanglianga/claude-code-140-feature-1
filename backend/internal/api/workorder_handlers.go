@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"net/http"
 
 	"pvplatform/internal/auth"
@@ -20,6 +21,7 @@ func (s *Server) createWorkOrder(w http.ResponseWriter, r *http.Request) {
 		WOType      string  `json:"wo_type"`
 		Cost        float64 `json:"cost"`
 		Assignee    string  `json:"assignee"`
+		UnitNo      string  `json:"unit_no"`
 	}
 	if err := decodeJSON(r, &in); err != nil || in.Title == "" || in.PeriodMonth == "" {
 		writeErr(w, 400, "title、period_month 必填")
@@ -28,12 +30,26 @@ func (s *Server) createWorkOrder(w http.ResponseWriter, r *http.Request) {
 	if in.WOType == "" {
 		in.WOType = "other"
 	}
+	if in.UnitNo == "" {
+		in.UnitNo = u.UnitNo
+	}
+	// 顶楼漏水：自动核查投诉住户此前是否签署屋顶使用同意
+	consentStatus := "unknown"
+	if in.WOType == "leak" {
+		var cnt int
+		if err := s.Pool.QueryRow(r.Context(),
+			`SELECT count(*) FROM rooftop_consents WHERE building_id=$1 AND user_id=$2`,
+			bid, u.ID).Scan(&cnt); err == nil && cnt > 0 {
+			consentStatus = "signed"
+		}
+	}
 	var id int64
 	err := s.Pool.QueryRow(r.Context(), `
-		INSERT INTO work_orders(building_id,inverter_id,period_month,title,description,wo_type,cost,assignee,reporter_id)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
+		INSERT INTO work_orders(building_id,inverter_id,period_month,title,description,wo_type,cost,assignee,reporter_id,
+			unit_no,resident_consent_status)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`,
 		bid, nullableID(in.InverterID), in.PeriodMonth, in.Title, in.Description, in.WOType,
-		in.Cost, in.Assignee, u.ID).Scan(&id)
+		in.Cost, in.Assignee, u.ID, in.UnitNo, consentStatus).Scan(&id)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -44,7 +60,7 @@ func (s *Server) createWorkOrder(w http.ResponseWriter, r *http.Request) {
 			`UPDATE inverters SET status='faulty', fault_note=$2, fault_at=now() WHERE id=$1`,
 			in.InverterID, in.Title)
 	}
-	writeJSON(w, 201, map[string]any{"id": id})
+	writeJSON(w, 201, map[string]any{"id": id, "resident_consent_status": consentStatus})
 }
 
 func (s *Server) listWorkOrders(w http.ResponseWriter, r *http.Request) {
@@ -56,7 +72,14 @@ func (s *Server) listWorkOrders(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.Pool.Query(r.Context(), `
 		SELECT w.id, COALESCE(w.inverter_id,0), COALESCE(i.name,''), w.period_month, w.title,
 			w.description, w.wo_type, w.responsibility, w.cost, w.status, w.assignee,
-			COALESCE(re.name,''), w.created_at, w.resolved_at
+			COALESCE(re.name,''), w.created_at, w.resolved_at,
+			COALESCE(w.unit_no,''), w.resident_consent_status,
+			(w.temporary_stoppage_at IS NOT NULL), (w.reassured_at IS NOT NULL),
+			(w.third_party_test_at IS NOT NULL), COALESCE(w.third_party_test_org,''),
+			COALESCE(w.conclusion_note,''), COALESCE(w.responsibility_allocation::text,'[]'),
+			(SELECT count(*) FROM work_order_attachments a WHERE a.work_order_id=w.id),
+			(SELECT count(*) FROM revenue_freezes f WHERE f.work_order_id=w.id),
+			COALESCE((SELECT f.status FROM revenue_freezes f WHERE f.work_order_id=w.id ORDER BY f.id DESC LIMIT 1),'')
 		FROM work_orders w
 		LEFT JOIN inverters i ON i.id=w.inverter_id
 		LEFT JOIN users re ON re.id=w.reporter_id
@@ -69,22 +92,33 @@ func (s *Server) listWorkOrders(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 	out := []any{}
 	for rows.Next() {
-		var id, invID int64
-		var title, desc, wtype, resp, status, assignee, reporter, month string
-		var invName string
+		var id, invID, attachCount, freezeCount int64
+		var title, desc, wtype, resp, status, assignee, reporter, monthStr string
+		var invName, unitNo, consent, testOrg, conclusion, allocJSON, freezeStatus string
+		var stoppage, reassured, tested bool
 		var cost float64
 		var createdAt, resolvedAt any
-		if err := rows.Scan(&id, &invID, &invName, &month, &title, &desc, &wtype, &resp,
-			&cost, &status, &assignee, &reporter, &createdAt, &resolvedAt); err != nil {
+		if err := rows.Scan(&id, &invID, &invName, &monthStr, &title, &desc, &wtype, &resp,
+			&cost, &status, &assignee, &reporter, &createdAt, &resolvedAt,
+			&unitNo, &consent, &stoppage, &reassured, &tested, &testOrg, &conclusion, &allocJSON,
+			&attachCount, &freezeCount, &freezeStatus); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}
+		var allocs []map[string]any
+		_ = json.Unmarshal([]byte(allocJSON), &allocs)
 		out = append(out, map[string]any{
 			"id": id, "inverter_id": invID, "inverter_name": invName,
-			"period_month": month, "title": title, "description": desc,
+			"period_month": monthStr, "title": title, "description": desc,
 			"wo_type": wtype, "responsibility": resp, "cost": cost,
 			"status": status, "assignee": assignee, "reporter": reporter,
 			"created_at": createdAt, "resolved_at": resolvedAt,
+			"unit_no": unitNo, "resident_consent_status": consent,
+			"temporary_stoppage": stoppage, "reassured": reassured,
+			"third_party_tested": tested, "third_party_org": testOrg,
+			"conclusion_note": conclusion, "responsibility_allocation": allocs,
+			"attachment_count": attachCount,
+			"freeze_count":     freezeCount, "freeze_status": freezeStatus,
 		})
 	}
 	writeJSON(w, 200, map[string]any{"items": out})
@@ -114,7 +148,8 @@ func (s *Server) updateWorkOrder(w http.ResponseWriter, r *http.Request) {
 	}
 	if in.Responsibility != "" && in.Responsibility != "undetermined" &&
 		in.Responsibility != "property" && in.Responsibility != "installer" &&
-		in.Responsibility != "owner" && in.Responsibility != "insurance" {
+		in.Responsibility != "owner" && in.Responsibility != "insurance" &&
+		in.Responsibility != "shared" {
 		writeErr(w, 400, "责任方不合法")
 		return
 	}

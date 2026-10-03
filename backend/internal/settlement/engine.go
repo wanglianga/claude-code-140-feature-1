@@ -19,22 +19,34 @@ type WorkOrder struct {
 	Title          string  `json:"title"`
 	Cost           float64 `json:"cost"`
 	Responsibility string  `json:"responsibility"`
+	// shared（多方按比例分担）时使用：
+	// SelfRatio  = 项目侧承担比例（物业/维修基金/公共收益/业主）合计 %
+	// ClaimRatio = 对方赔偿比例（施工方/保险）合计 %，两者之和应为 100
+	SelfRatio  float64 `json:"self_ratio"`
+	ClaimRatio float64 `json:"claim_ratio"`
+}
+
+// FreezeTarget 当期被暂时冻结的分配对象：UserID=0 表示公共部分；Ratio 为冻结其当期收益的百分比。
+type FreezeTarget struct {
+	UserID int64   `json:"user_id"`
+	Ratio  float64 `json:"ratio"`
 }
 
 // Input 月度结算输入
 type Input struct {
 	BuildingID   int64
-	PeriodMonth  string      `json:"period_month"`
-	TotalKwh     float64     `json:"total_kwh"`
-	GridPrice    float64     `json:"grid_price"`   // 上网电价 元/kWh
-	SubsidyRate  float64     `json:"subsidy_rate"` // 度电补贴 元/kWh
-	OmFee        float64     `json:"om_fee"`       // 当期运维费(元)
-	Tax          float64     `json:"tax"`          // 当期税费(元)
-	FundRatio    float64     `json:"fund_ratio"`   // 公共净收益划入维修基金比例 %
-	FundBalance  float64     `json:"fund_balance"` // 维修基金当前余额
-	Compensation float64     `json:"compensation"` // 安装商/保险当期赔偿
-	Shareholders []Share     `json:"shareholders"`
-	WorkOrders   []WorkOrder `json:"work_orders"`
+	PeriodMonth  string         `json:"period_month"`
+	TotalKwh     float64        `json:"total_kwh"`
+	GridPrice    float64        `json:"grid_price"`   // 上网电价 元/kWh
+	SubsidyRate  float64        `json:"subsidy_rate"` // 度电补贴 元/kWh
+	OmFee        float64        `json:"om_fee"`       // 当期运维费(元)
+	Tax          float64        `json:"tax"`          // 当期税费(元)
+	FundRatio    float64        `json:"fund_ratio"`   // 公共净收益划入维修基金比例 %
+	FundBalance  float64        `json:"fund_balance"` // 维修基金当前余额
+	Compensation float64        `json:"compensation"` // 安装商/保险当期赔偿
+	Shareholders []Share        `json:"shareholders"`
+	WorkOrders   []WorkOrder    `json:"work_orders"`
+	Freezes      []FreezeTarget `json:"freezes"`
 }
 
 // Item 结算明细行
@@ -49,7 +61,9 @@ type Item struct {
 	OmShare  float64 `json:"om_share"`
 	TaxShare float64 `json:"tax_share"`
 	WoShare  float64 `json:"wo_share"`
-	Amount   float64 `json:"amount"`
+	Amount   float64 `json:"amount"`  // 应分得金额（冻结前）
+	Frozen   float64 `json:"frozen"`  // 因漏水投诉暂时冻结的金额
+	Payable  float64 `json:"payable"` // 本期实际入账金额
 	Memo     string  `json:"memo"`
 }
 
@@ -61,7 +75,8 @@ type Result struct {
 	TotalSubsidy      float64 `json:"total_subsidy"`
 	OmFee             float64 `json:"om_fee"`
 	Tax               float64 `json:"tax"`
-	WorkOrderCost     float64 `json:"work_order_cost"` // property/owner 责任的维修费用合计
+	WorkOrderCost     float64 `json:"work_order_cost"`  // 项目侧承担（property/owner/shared 自担部分）的维修费用合计
+	WorkOrderClaim    float64 `json:"work_order_claim"` // shared 责任中由施工方/保险赔偿的部分
 	Compensation      float64 `json:"compensation"`
 	FundUsed          float64 `json:"fund_used"`     // 维修基金动用金额
 	RepairDeduct      float64 `json:"repair_deduct"` // 维修净支出（按组件比例分摊）
@@ -70,7 +85,9 @@ type Result struct {
 	FundRatio         float64 `json:"fund_ratio"`
 	FundAddition      float64 `json:"fund_addition"` // 本期公共收益计提维修基金
 	PublicDistributab float64 `json:"public_distributable"`
-	Distributable     float64 `json:"distributable"` // 当期可分配净额合计
+	Distributable     float64 `json:"distributable"` // 当期可分配净额合计（冻结前）
+	FrozenTotal       float64 `json:"frozen_total"`  // 因漏水投诉暂时冻结的收益合计
+	PayableTotal      float64 `json:"payable_total"` // 本期实际入账合计
 	CarbonKg          float64 `json:"carbon_kg"`
 	Items             []Item  `json:"items"`
 }
@@ -105,13 +122,28 @@ func Compute(in Input) Result {
 	res.ShareholderRatio = round2(sRatio)
 	res.PublicRatio = round2(100 - sRatio)
 
-	var woCost float64
+	var woCost, woClaim float64
 	for _, w := range in.WorkOrders {
-		if w.Responsibility == "property" || w.Responsibility == "owner" {
+		switch w.Responsibility {
+		case "property", "owner":
 			woCost += w.Cost
+		case "shared":
+			// 多方按比例分担：自担部分进维修费用，对方（施工方/保险）部分计赔偿
+			self, claim := w.SelfRatio, w.ClaimRatio
+			if self == 0 && claim == 0 {
+				self = 100
+			}
+			if self+claim > 0 {
+				woCost += w.Cost * self / (self + claim)
+				woClaim += w.Cost * claim / (self + claim)
+			} else {
+				woCost += w.Cost
+			}
 		}
 	}
 	res.WorkOrderCost = round2(woCost)
+	res.WorkOrderClaim = round2(woClaim)
+	res.Compensation = round2(in.Compensation + woClaim)
 	repairGross := math.Max(0, woCost-in.Compensation)
 	res.FundUsed = round2(math.Min(in.FundBalance, repairGross))
 	res.RepairDeduct = round2(repairGross - res.FundUsed)
@@ -158,13 +190,64 @@ func Compute(in Input) Result {
 	res.Items = append(res.Items, fund)
 
 	res.PublicDistributab = round2(pub.Amount - res.FundAddition)
-	var dist float64
+
+	// 漏水投诉处置期间，相关组件/公共部分收益按冻结单比例暂时冻结，定稿时只入账未冻结部分。
+	// 冻结额不超过该对象当期可分配现金（住户为正收益、公共为计提基金后的可支配额）。
+	freezeRatioOf := func(uid int64) float64 {
+		var r0 float64
+		for _, f := range in.Freezes {
+			if f.UserID == uid {
+				r0 += f.Ratio
+			}
+		}
+		if r0 > 100 {
+			r0 = 100
+		}
+		return r0
+	}
+	for i := range res.Items {
+		it := &res.Items[i]
+		var ratio, capAmt float64
+		switch it.ItemType {
+		case "shareholder":
+			if it.UserID != nil {
+				ratio = freezeRatioOf(*it.UserID)
+			}
+			capAmt = math.Max(0, it.Amount)
+		case "public":
+			ratio = freezeRatioOf(0)
+			capAmt = math.Max(0, res.PublicDistributab)
+		default:
+			continue
+		}
+		if ratio > 0 {
+			it.Frozen = round2(math.Min(capAmt, it.Amount*ratio/100))
+			if it.Frozen < 0 {
+				it.Frozen = 0
+			}
+		}
+		it.Payable = round2(it.Amount - it.Frozen)
+	}
+	// 公共部分冻结后，可支配额相应扣减
+	var publicFrozen float64
+	for i := range res.Items {
+		if res.Items[i].ItemType == "public" {
+			publicFrozen = res.Items[i].Frozen
+		}
+	}
+	res.PublicDistributab = round2(res.PublicDistributab - publicFrozen)
+
+	var dist, frozen, payable float64
 	for _, it := range res.Items {
 		if it.ItemType == "shareholder" {
 			dist += it.Amount
+			frozen += it.Frozen
+			payable += it.Payable
 		}
 	}
-	dist += res.PublicDistributab
+	dist += res.PublicDistributab + publicFrozen
 	res.Distributable = round2(dist)
+	res.FrozenTotal = round2(frozen + publicFrozen)
+	res.PayableTotal = round2(payable + res.PublicDistributab)
 	return res
 }
