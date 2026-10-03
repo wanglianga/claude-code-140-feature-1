@@ -260,8 +260,15 @@ func (s *Server) getSettlement(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.Pool.Query(r.Context(), `
 		SELECT si.id, COALESCE(si.user_id,0), COALESCE(u.name,'公共账户'), si.item_type,
 			si.ratio, si.kwh, si.revenue, si.subsidy, si.om_share, si.tax_share, si.wo_share,
-			si.amount, COALESCE(si.memo,'')
+			si.amount, COALESCE(si.memo,''),
+			COALESCE(fl.total_frozen,0), COALESCE(fl.fstatus,'')
 		FROM settlement_items si LEFT JOIN users u ON u.id=si.user_id
+		LEFT JOIN LATERAL (
+			SELECT SUM(amount) AS total_frozen,
+			       CASE WHEN bool_or(status='held') THEN 'held' ELSE 'released' END AS fstatus
+			FROM freeze_ledger WHERE settlement_id=si.period_id AND user_id=si.user_id
+			HAVING count(*) > 0
+		) fl ON TRUE
 		WHERE si.period_id=$1
 		ORDER BY CASE si.item_type WHEN 'shareholder' THEN 1 WHEN 'public' THEN 2 ELSE 3 END, si.id`, sid)
 	if err != nil {
@@ -272,10 +279,10 @@ func (s *Server) getSettlement(w http.ResponseWriter, r *http.Request) {
 	items := []any{}
 	for rows.Next() {
 		var id, uid int64
-		var name, itype, memo string
-		var ratio, ikwh, rev, sub, omS, taxS, woS, amount float64
+		var name, itype, memo, freezeStatus string
+		var ratio, ikwh, rev, sub, omS, taxS, woS, amount, frozenAmt float64
 		if err := rows.Scan(&id, &uid, &name, &itype, &ratio, &ikwh, &rev, &sub,
-			&omS, &taxS, &woS, &amount, &memo); err != nil {
+			&omS, &taxS, &woS, &amount, &memo, &frozenAmt, &freezeStatus); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}
@@ -283,6 +290,7 @@ func (s *Server) getSettlement(w http.ResponseWriter, r *http.Request) {
 			"id": id, "user_id": uid, "name": name, "item_type": itype,
 			"ratio": ratio, "kwh": ikwh, "revenue": rev, "subsidy": sub,
 			"om_share": omS, "tax_share": taxS, "wo_share": woS, "amount": amount, "memo": memo,
+			"frozen_amount": frozenAmt, "freeze_status": freezeStatus,
 		})
 	}
 	writeJSON(w, 200, map[string]any{
@@ -366,6 +374,41 @@ func (s *Server) finalizeSettlement(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 漏水维修期间仍处于 frozen 的收益冻结单：targeted 仅冻结指定的相关组件持有人（缺省为报修顶楼住户），
+	// all 冻结整楼全部认购住户；自冻结起始月起的每期定稿分成挂账，暂不计入住户余额。
+	allScopeFreezes := []int64{}
+	targetedFreezes := map[int64][]int64{}
+	frows, err := tx.Query(r.Context(), `
+		SELECT f.id, f.scope, COALESCE(w.reporter_id,0),
+			(SELECT COALESCE(array_agg(user_id), ARRAY[]::bigint[]) FROM freeze_targets ft WHERE ft.freeze_id=f.id)
+		FROM revenue_freezes f JOIN work_orders w ON w.id=f.work_order_id
+		WHERE f.building_id=$1 AND f.status='frozen' AND f.period_month <= $2`, bid, month)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	for frows.Next() {
+		var fid, reporter int64
+		var scope string
+		var targets []int64
+		if err := frows.Scan(&fid, &scope, &reporter, &targets); err != nil {
+			frows.Close()
+			writeErr(w, 500, err.Error())
+			return
+		}
+		if scope == "all" {
+			allScopeFreezes = append(allScopeFreezes, fid)
+		} else {
+			if len(targets) == 0 && reporter != 0 {
+				targets = []int64{reporter}
+			}
+			for _, tuid := range targets {
+				targetedFreezes[tuid] = append(targetedFreezes[tuid], fid)
+			}
+		}
+	}
+	frows.Close()
+
 	// 楼级现金账（公共账户）：收入、赔偿与费用按总额记账；
 	// maintenance_fund 类别仅作专款标记，不计入公共账户现金净额。
 	led := func(uid any, dir, cat string, amount float64, memo string) {
@@ -402,11 +445,39 @@ func (s *Server) finalizeSettlement(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			uid := *it.UserID
+			// 该住户本期分成是否落入某个仍生效的漏水收益冻结单
+			freezeIDs := append([]int64{}, allScopeFreezes...)
+			freezeIDs = append(freezeIDs, targetedFreezes[uid]...)
+			frozen := len(freezeIDs) > 0 && it.Amount > 0
 			led(uid, "in", "revenue", it.Revenue, month+" 住户发电收益")
 			led(uid, "in", "subsidy", it.Subsidy, month+" 住户补贴分成")
 			led(uid, "out", "om", it.Om, month+" 运维费分摊")
 			led(uid, "out", "tax", it.Tax, month+" 税费分摊")
 			led(uid, "out", "repair", it.Wo, month+" 维修费分摊（基金不足部分）")
+			if frozen {
+				// 挂账到冻结单（唯一索引防止重复），暂不计入住户余额；责任确认后按比例释放
+				for _, fid := range freezeIDs {
+					ct, err := tx.Exec(r.Context(), `
+						INSERT INTO freeze_ledger(freeze_id,building_id,settlement_id,user_id,period_month,amount)
+						VALUES ($1,$2,$3,$4,$5,$6)
+						ON CONFLICT (freeze_id,settlement_id,user_id) DO NOTHING`,
+						fid, bid, sid, uid, month, it.Amount)
+					if err != nil {
+						writeErr(w, 500, err.Error())
+						return
+					}
+					if ct.RowsAffected() == 1 {
+						if _, err := tx.Exec(r.Context(),
+							`UPDATE revenue_freezes SET frozen_total=frozen_total+$2 WHERE id=$1`,
+							fid, it.Amount); err != nil {
+							writeErr(w, 500, err.Error())
+							return
+						}
+					}
+				}
+				led(uid, "out", "freeze_hold", it.Amount, month+" 漏水维修期间相关组件收益冻结挂账")
+				continue
+			}
 			if _, err := tx.Exec(r.Context(),
 				`UPDATE users SET balance=balance+$2 WHERE id=$1`, uid, it.Amount); err != nil {
 				writeErr(w, 500, err.Error())
@@ -558,6 +629,16 @@ func (s *Server) buildingDashboard(w http.ResponseWriter, r *http.Request) {
 		`SELECT count(*) FILTER (WHERE status<>'resolved'), count(*) FILTER (WHERE status='resolved')
 		 FROM work_orders WHERE building_id=$1`, bid).Scan(&woOpen, &woResolved)
 
+	// 漏水收益冻结：生效中的冻结单数与挂账中金额
+	var freezeActive int
+	var freezeHeld float64
+	_ = s.Pool.QueryRow(r.Context(),
+		`SELECT count(*), COALESCE((
+			SELECT SUM(amount) FROM freeze_ledger fl
+			JOIN revenue_freezes rf ON rf.id=fl.freeze_id
+			WHERE rf.building_id=$1 AND fl.status='held'),0)
+		 FROM revenue_freezes WHERE building_id=$1 AND status='frozen'`, bid).Scan(&freezeActive, &freezeHeld)
+
 	rows, err := s.Pool.Query(r.Context(), `
 		SELECT period_month, total_kwh, gross_revenue, total_subsidy, distributable, status
 		FROM settlement_periods WHERE building_id=$1 ORDER BY period_month`, bid)
@@ -594,6 +675,8 @@ func (s *Server) buildingDashboard(w http.ResponseWriter, r *http.Request) {
 	d["resident_count"] = residentCount
 	d["work_orders_open"] = woOpen
 	d["work_orders_resolved"] = woResolved
+	d["revenue_freeze_active"] = freezeActive
+	d["revenue_freeze_held"] = freezeHeld
 	d["monthly_series"] = series
 	writeJSON(w, 200, d)
 }

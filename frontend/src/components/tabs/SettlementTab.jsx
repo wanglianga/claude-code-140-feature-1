@@ -118,7 +118,7 @@ export default function SettlementTab({ user, building }) {
               <tr>
                 <th>分配对象</th><th>类型</th><th className="num">占比</th><th className="num">电量</th>
                 <th className="num">电费</th><th className="num">补贴</th><th className="num">运维分摊</th>
-                <th className="num">税分摊</th><th className="num">维修分摊</th><th className="num">分得金额</th>
+                <th className="num">税分摊</th><th className="num">维修分摊</th><th className="num">分得金额</th><th>到账</th>
               </tr>
             </thead>
             <tbody>
@@ -134,6 +134,13 @@ export default function SettlementTab({ user, building }) {
                   <td className="num">{fmtMoney(it.tax_share)}</td>
                   <td className="num">{fmtMoney(it.wo_share)}</td>
                   <td className="num"><b>{fmtMoney(it.amount)}</b></td>
+                  <td>
+                    {it.item_type === 'shareholder' && Number(it.frozen_amount) > 0 && (
+                      <span className={'badge ' + (it.freeze_status === 'held' ? 'amber' : 'green')}>
+                        {it.freeze_status === 'held' ? `冻结挂账 ¥${fmtMoney(it.frozen_amount)}` : `已释放 ¥${fmtMoney(it.frozen_amount)}`}
+                      </span>
+                    )}
+                  </td>
                 </tr>
               ))}
             </tbody>

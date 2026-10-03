@@ -56,10 +56,12 @@ func (s *Server) listWorkOrders(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.Pool.Query(r.Context(), `
 		SELECT w.id, COALESCE(w.inverter_id,0), COALESCE(i.name,''), w.period_month, w.title,
 			w.description, w.wo_type, w.responsibility, w.cost, w.status, w.assignee,
-			COALESCE(re.name,''), w.created_at, w.resolved_at
+			COALESCE(re.name,''), w.created_at, w.resolved_at,
+			COALESCE(rf.id,0), COALESCE(rf.status,'')
 		FROM work_orders w
 		LEFT JOIN inverters i ON i.id=w.inverter_id
 		LEFT JOIN users re ON re.id=w.reporter_id
+		LEFT JOIN revenue_freezes rf ON rf.work_order_id=w.id
 		WHERE w.building_id=$1 AND ($2='' OR w.period_month=$2)
 		ORDER BY w.period_month DESC, w.id DESC`, bid, month)
 	if err != nil {
@@ -69,13 +71,14 @@ func (s *Server) listWorkOrders(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 	out := []any{}
 	for rows.Next() {
-		var id, invID int64
+		var id, invID, freezeID int64
 		var title, desc, wtype, resp, status, assignee, reporter, month string
-		var invName string
+		var invName, freezeStatus string
 		var cost float64
 		var createdAt, resolvedAt any
 		if err := rows.Scan(&id, &invID, &invName, &month, &title, &desc, &wtype, &resp,
-			&cost, &status, &assignee, &reporter, &createdAt, &resolvedAt); err != nil {
+			&cost, &status, &assignee, &reporter, &createdAt, &resolvedAt,
+			&freezeID, &freezeStatus); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}
@@ -85,6 +88,7 @@ func (s *Server) listWorkOrders(w http.ResponseWriter, r *http.Request) {
 			"wo_type": wtype, "responsibility": resp, "cost": cost,
 			"status": status, "assignee": assignee, "reporter": reporter,
 			"created_at": createdAt, "resolved_at": resolvedAt,
+			"freeze_id": freezeID, "freeze_status": freezeStatus,
 		})
 	}
 	writeJSON(w, 200, map[string]any{"items": out})

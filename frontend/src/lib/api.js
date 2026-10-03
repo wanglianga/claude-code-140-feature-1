@@ -58,3 +58,18 @@ export const WO_RESP = {
   owner: '业主',
   insurance: '保险',
 }
+export const EVIDENCE_TYPES = {
+  construction_photo: '施工照片',
+  waterproof_acceptance: '屋顶防水验收',
+  rainfall: '雨量记录',
+  consent: '顶楼住户同意签署',
+  inspection_report: '第三方检测报告',
+}
+export const ACTION_TYPES = {
+  temporary_seal: '临时止水',
+  resident_reassurance: '住户安抚',
+  third_party_inspection: '第三方检测',
+  repair: '正式维修',
+  other: '其他处置',
+}
+export const FREEZE_STATUS = { frozen: '冻结中', released: '已释放' }

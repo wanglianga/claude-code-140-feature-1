@@ -76,7 +76,21 @@ func (s *Server) Router() http.Handler {
 		// 维修工单
 		r.Get("/buildings/{id}/work-orders", s.listWorkOrders)
 		r.Post("/buildings/{id}/work-orders", s.createWorkOrder)
+		r.Get("/work-orders/{wid}", s.getWorkOrder)
 		r.Post("/work-orders/{wid}", s.updateWorkOrder)
+		r.Post("/work-orders/{wid}/evidences", s.addWorkOrderEvidence)
+		r.Post("/work-orders/{wid}/actions", s.addWorkOrderAction)
+
+		// 顶楼漏水：维修期间收益冻结与责任确认后按比例释放
+		r.Get("/buildings/{id}/freezes", s.listFreezes)
+		r.Post("/buildings/{id}/freezes", s.createFreeze)
+		r.Get("/freezes/{fid}", s.getFreeze)
+		r.Post("/freezes/{fid}/release", s.releaseFreeze)
+
+		// 屋顶巡检计划
+		r.Get("/buildings/{id}/inspections", s.listInspections)
+		r.Post("/buildings/{id}/inspections", s.createInspection)
+		r.Post("/inspections/{iid}", s.updateInspection)
 
 		// 结算与台账
 		r.Get("/buildings/{id}/settlements", s.listSettlements)

@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react'
-import { api, fmtMoney, WO_RESP } from '../../lib/api'
+import { api, fmtMoney, WO_RESP, FREEZE_STATUS } from '../../lib/api'
 import { Badge, handleErr, useToast } from '../ui'
+import LeakCasePanel from './LeakCasePanel'
 
 const WO_TYPES = { leak: '屋顶漏水', inverter: '逆变器故障', channel: '维护通道', other: '其他' }
 const RESP_OPTS = [
@@ -16,8 +17,9 @@ export default function WorkOrderTab({ user, building }) {
   const isManager = user.role === 'admin' || user.role === 'property'
   const [wos, setWos] = useState([])
   const [inverters, setInverters] = useState([])
+  const [openLeakId, setOpenLeakId] = useState(null)
   const [form, setForm] = useState({
-    period_month: '2026-09', title: '', description: '', wo_type: 'leak',
+    period_month: '2026-10', title: '', description: '', wo_type: 'leak',
     inverter_id: 0, cost: 0, assignee: '',
   })
 
@@ -34,10 +36,11 @@ export default function WorkOrderTab({ user, building }) {
   const create = async () => {
     if (!form.title) return notify('请填写工单标题', true)
     try {
-      await handleErr(api('POST', `/buildings/${building.id}/work-orders`, form), notify)
+      const r = await handleErr(api('POST', `/buildings/${building.id}/work-orders`, form), notify)
       notify('维修工单已创建')
       setForm({ ...form, title: '', description: '' })
-      load()
+      await load()
+      if (form.wo_type === 'leak') setOpenLeakId(r.id)
     } catch { /* toast */ }
   }
 
@@ -49,13 +52,18 @@ export default function WorkOrderTab({ user, building }) {
     } catch { /* toast */ }
   }
 
+  if (openLeakId) {
+    return <LeakCasePanel user={user} building={building} woId={openLeakId} onClose={() => { setOpenLeakId(null); load() }} />
+  }
+
   return (
     <>
       <div className="card">
         <h2>报修 / 维修工单</h2>
         <p className="muted small">
-          顶楼漏水、逆变器故障、维护通道占用等均可报单。责任判定与费用会影响<b>对应周期</b>的收益结算：
-          物业/业主责任由维修基金先行支付、不足部分按组件比例分摊；安装商/保险责任由对方赔偿，不冲减住户收益。
+          顶楼漏水、逆变器故障、维护通道占用等均可报单。<b>顶楼漏水</b>可建立专项档案：关联施工照片、屋顶防水验收、
+          雨量记录与住户此前是否签署同意；责任无法确认时安排临时止水、住户安抚、第三方检测，
+          并可在维修期间<b>暂时冻结相关组件收益</b>，责任确认后按施工方赔付 / 运维基金 / 楼栋公共收益 / 业主自担比例释放。
         </p>
         <div className="form-row">
           <label className="field">
@@ -82,7 +90,7 @@ export default function WorkOrderTab({ user, building }) {
           <label className="field"><span>指派处理人</span><input value={form.assignee} onChange={(e) => setForm({ ...form, assignee: e.target.value })} /></label>
           <button className="primary" onClick={create}>提交工单</button>
         </div>
-        <label className="field"><span>问题描述</span><textarea value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} /></label>
+        <label className="field"><span>问题描述（渗漏位置、雨后现象等）</span><textarea value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} /></label>
       </div>
 
       <div className="card">
@@ -91,7 +99,7 @@ export default function WorkOrderTab({ user, building }) {
           <thead>
             <tr>
               <th>月份</th><th>类型</th><th>问题</th><th>设备</th><th className="num">费用</th>
-              <th>责任方</th><th>处理人</th><th>状态</th>{isManager && <th>操作</th>}
+              <th>责任方</th><th>处理人</th><th>状态</th><th>收益冻结</th>{isManager && <th>操作</th>}
             </tr>
           </thead>
           <tbody>
@@ -103,12 +111,20 @@ export default function WorkOrderTab({ user, building }) {
                   <b>{wo.title}</b>
                   {wo.description && <div className="small muted">{wo.description}</div>}
                   <div className="small muted">报修人：{wo.reporter}</div>
+                  {wo.wo_type === 'leak' && (
+                    <button className="sm" style={{ marginTop: 4 }} onClick={() => setOpenLeakId(wo.id)}>📁 漏水投诉档案</button>
+                  )}
                 </td>
                 <td className="small">{wo.inverter_name || '—'}</td>
                 <td className="num">¥{fmtMoney(wo.cost)}</td>
                 <td><Badge value={wo.responsibility === 'undetermined' ? 'pending' : wo.status} /><span style={{ marginLeft: 4 }}>{WO_RESP[wo.responsibility]}</span></td>
                 <td className="small">{wo.assignee || '—'}</td>
                 <td><Badge value={wo.status} /></td>
+                <td>
+                  {wo.freeze_status === 'frozen' && <span className="badge amber">{FREEZE_STATUS.frozen}</span>}
+                  {wo.freeze_status === 'released' && <span className="badge green">{FREEZE_STATUS.released}</span>}
+                  {!wo.freeze_status && <span className="small muted">—</span>}
+                </td>
                 {isManager && (
                   <td>
                     <div className="btn-row">

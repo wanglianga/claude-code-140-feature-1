@@ -418,4 +418,172 @@ func TestFullLifecycle(t *testing.T) {
 		map[string]string{"to_stage": "construction", "reason": "设备供应延迟，组件到货推迟"}); st != 200 {
 		t.Fatalf("有原因回退应 200: %d %v", st, out)
 	}
+
+	// ===== 顶楼雨后漏水投诉：证据链 + 临时处置 + 相关组件收益冻结 + 按责任比例释放 =====
+	var fz, meC map[string]any
+	// 甲已把房屋及认购权益转给丙，丙现为 3-601 顶楼住户与 40% 组件持有人
+	st, out = c.do("POST", fmt.Sprintf("/api/buildings/%d/work-orders", bid), tC, map[string]any{
+		"period_month": "2026-11", "title": "新装支架位置顶板滴水", "wo_type": "leak",
+		"description": "暴雨后东侧新装支架锚固点下方滴水",
+	})
+	if st != 201 {
+		t.Fatalf("新漏水工单: %d %v", st, out)
+	}
+	leakID := int64(out["id"].(float64))
+
+	// 四类证据 + 第三方报告
+	evidences := []map[string]any{
+		{"evidence_type": "construction_photo", "title": "支架穿层节点施工照片", "recorded_on": "2026-07-01", "source": "安装商"},
+		{"evidence_type": "waterproof_acceptance", "title": "屋顶防水验收记录", "detail": "蓄水试验合格，穿层节点五年质保", "recorded_on": "2026-07-05"},
+		{"evidence_type": "rainfall", "title": "11月降雨记录", "detail": "小时雨强 22mm/h", "recorded_on": "2026-11-08", "amount": 68.5, "source": "气象局"},
+		{"evidence_type": "consent", "title": "顶楼住户施工同意书", "detail": "业主已签署，但东侧加装支架未单独征询", "recorded_on": "2026-06-01"},
+	}
+	for _, e := range evidences {
+		if st, out := c.do("POST", fmt.Sprintf("/api/work-orders/%d/evidences", leakID), tC, e); st != 201 {
+			t.Fatalf("关联证据 %v: %d %v", e["evidence_type"], st, out)
+		}
+	}
+	// 责任无法确认：平台安排临时止水、住户安抚、第三方检测
+	for _, a := range []map[string]any{
+		{"action_type": "temporary_seal", "content": "铺设临时防水卷材，导流止水", "cost": 300},
+		{"action_type": "resident_reassurance", "content": "上门安抚并垫付住宿", "cost": 600},
+		{"action_type": "third_party_inspection", "content": "第三方开孔检测穿层密封", "cost": 1500},
+	} {
+		if st, out := c.do("POST", fmt.Sprintf("/api/work-orders/%d/actions", leakID), admin, a); st != 201 {
+			t.Fatalf("处置 %v: %d %v", a["action_type"], st, out)
+		}
+	}
+	// 非法证据/处置类型应 400
+	if st, _ := c.do("POST", fmt.Sprintf("/api/work-orders/%d/evidences", leakID), tC,
+		map[string]string{"evidence_type": "bogus", "title": "x"}); st != 400 {
+		t.Fatalf("非法证据类型应 400, got %d", st)
+	}
+	if st, _ := c.do("POST", fmt.Sprintf("/api/work-orders/%d/actions", leakID), tC,
+		map[string]string{"action_type": "temporary_seal", "content": "住户不能安排处置"}); st != 403 {
+		t.Fatalf("住户安排处置应 403, got %d", st)
+	}
+
+	// 工单详情聚合证据链/处置过程
+	st, out = c.do("GET", fmt.Sprintf("/api/work-orders/%d", leakID), admin, nil)
+	if st != 200 || len(out["evidences"].([]any)) != 4 || len(out["actions"].([]any)) != 3 {
+		t.Fatalf("工单详情证据/处置缺失: %v", out)
+	}
+
+	// 设立定向收益冻结（相关组件持有人=丙），自 11 月起
+	st, out = c.do("POST", fmt.Sprintf("/api/buildings/%d/freezes", bid), admin, map[string]any{
+		"work_order_id": leakID, "period_month": "2026-11", "scope": "targeted",
+		"target_user_ids": []int64{idC},
+	})
+	if st != 201 {
+		t.Fatalf("创建冻结单: %d %v", st, out)
+	}
+	freezeID := int64(out["id"].(float64))
+	// 同一工单重复冻结应 409
+	if st, _ = c.do("POST", fmt.Sprintf("/api/buildings/%d/freezes", bid), admin, map[string]any{
+		"work_order_id": leakID, "period_month": "2026-11",
+	}); st != 409 {
+		t.Fatalf("重复冻结应 409, got %d", st)
+	}
+
+	// 11 月发电与结算：丙 40% 分成 192 应被冻结挂账，不进余额
+	if st, out := c.do("POST", fmt.Sprintf("/api/buildings/%d/stage", bid), admin,
+		map[string]string{"to_stage": "grid_acceptance"}); st != 200 {
+		t.Fatalf("恢复至并网验收: %d %v", st, out)
+	}
+	if st, out := c.do("POST", fmt.Sprintf("/api/buildings/%d/stage", bid), admin,
+		map[string]string{"to_stage": "operating", "reason": "设备到货，恢复运营"}); st != 200 {
+		t.Fatalf("恢复运营: %d %v", st, out)
+	}
+	for _, x := range []struct {
+		inv int64
+		kwh float64
+	}{{inv1, 600}, {inv2, 600}} {
+		c.do("POST", fmt.Sprintf("/api/buildings/%d/generation", bid), admin, map[string]any{
+			"period_month": "2026-11", "inverter_id": x.inv, "kwh": x.kwh,
+		})
+	}
+	st, out = c.do("POST", fmt.Sprintf("/api/buildings/%d/settlements", bid), admin, map[string]any{
+		"period_month": "2026-11", "grid_price": 0.4,
+	})
+	if st != 200 {
+		t.Fatalf("11月结算: %d %v", st, out)
+	}
+	novID := int64(out["id"].(float64))
+	if st, _ := c.do("POST", fmt.Sprintf("/api/settlements/%d/finalize", novID), admin, nil); st != 200 {
+		t.Fatalf("11月定稿应 200, got %d", st)
+	}
+	// 冻结挂账 192，丙余额仍为 10 月的 192
+	st, fz = c.do("GET", fmt.Sprintf("/api/freezes/%d", freezeID), admin, nil)
+	if fz["frozen_total"].(float64) != 192 {
+		t.Fatalf("冻结挂账=%v want 192", fz["frozen_total"])
+	}
+	if len(fz["items"].([]any)) != 1 {
+		t.Fatalf("挂账明细应有 1 条: %v", fz["items"])
+	}
+	st, meC = c.do("GET", "/api/me", tC, nil)
+	if meC["balance"].(string) != "192.00" {
+		t.Fatalf("冻结期间丙余额应保持 192.00, got %v", meC["balance"])
+	}
+	// 结算明细中丙的分成带冻结挂账标记
+	st, sd := c.do("GET", fmt.Sprintf("/api/settlements/%d", novID), admin, nil)
+	var cFrozen float64
+	for _, it := range sd["items"].([]any) {
+		m := it.(map[string]any)
+		if m["item_type"] == "shareholder" && int64(m["user_id"].(float64)) == idC {
+			cFrozen = m["frozen_amount"].(float64)
+		}
+	}
+	if cFrozen != 192 {
+		t.Fatalf("丙的结算行冻结标记=%v want 192", cFrozen)
+	}
+
+	// 责任比例非法（合计 90）应 400
+	if st, _ = c.do("POST", fmt.Sprintf("/api/freezes/%d/release", freezeID), admin, map[string]any{
+		"installer_pct": 60, "fund_pct": 10, "public_pct": 20, "owner_pct": 0,
+	}); st != 400 {
+		t.Fatalf("比例合计 90 应 400, got %d", st)
+	}
+	// 责任确认：施工方 60% / 运维基金 10% / 公共收益 20% / 业主自担 10%
+	st, out = c.do("POST", fmt.Sprintf("/api/freezes/%d/release", freezeID), admin, map[string]any{
+		"installer_pct": 60, "fund_pct": 10, "public_pct": 20, "owner_pct": 10,
+		"liability_note": "第三方检测认定穿层密封不达标，施工方主责",
+	})
+	if st != 200 {
+		t.Fatalf("按比例释放: %d %v", st, out)
+	}
+	// 192: 施工方 115.20 + 基金 19.20 + 公共 38.40 = 172.80 发放；业主自担 19.20
+	if out["released_to_owner"].(float64) != 172.8 || out["owner_borne"].(float64) != 19.2 ||
+		out["installer_compensation"].(float64) != 115.2 {
+		t.Fatalf("释放金额错误: %v", out)
+	}
+	st, meC = c.do("GET", "/api/me", tC, nil)
+	if meC["balance"].(string) != "364.80" {
+		t.Fatalf("释放后丙余额=192+172.80=364.80, got %v", meC["balance"])
+	}
+	// 冻结单已释放，重复释放 409
+	if st, _ = c.do("POST", fmt.Sprintf("/api/freezes/%d/release", freezeID), admin,
+		map[string]any{"installer_pct": 100}); st != 409 {
+		t.Fatalf("重复释放应 409, got %d", st)
+	}
+	// 处理结论写入后续屋顶巡检计划
+	st, ins := c.do("GET", fmt.Sprintf("/api/buildings/%d/inspections", bid), admin, nil)
+	if st != 200 || len(ins["items"].([]any)) == 0 {
+		t.Fatalf("应生成后续巡检计划: %v", ins)
+	}
+	found := false
+	for _, it := range ins["items"].([]any) {
+		m := it.(map[string]any)
+		if int64(m["work_order_id"].(float64)) == leakID && m["status"] == "scheduled" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("未找到关联漏水工单 %d 的待巡检计划", leakID)
+	}
+	// 登记巡检完成
+	inspID := int64(ins["items"].([]any)[0].(map[string]any)["id"].(float64))
+	if st, _ := c.do("POST", fmt.Sprintf("/api/inspections/%d", inspID), admin,
+		map[string]string{"status": "done", "result_note": "未见复渗"}); st != 200 {
+		t.Fatalf("登记巡检完成应 200, got %d", st)
+	}
 }

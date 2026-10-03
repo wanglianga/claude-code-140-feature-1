@@ -161,6 +161,54 @@ func Run(ctx context.Context, pool *pgxpool.Pool) error {
 		b1, r1); err != nil {
 		return err
 	}
+
+	// 10 月雨后新投诉：新装光伏支架位置渗水，责任一时无法确认；证据链 + 临时处置 + 相关组件收益冻结
+	var wo2 int64
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO work_orders(building_id,inverter_id,period_month,title,description,wo_type,responsibility,cost,status,reporter_id,assignee)
+		VALUES ($1,NULL,'2026-10','601 次卧顶板雨后滴水（新装支架位置）','10月2日暴雨后，新装东侧支架锚固点正下方顶板出现滴水，次日减弱；住户怀疑支架穿层防水未做好','leak','undetermined',0,'processing',$2,'防水班组-周工')
+		RETURNING id`, b1, r1).Scan(&wo2); err != nil {
+		return err
+	}
+	ev := func(etype, title, detail, on string, amount any, source string) {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO work_order_evidences(work_order_id,building_id,evidence_type,title,detail,recorded_on,amount,source,created_by)
+			VALUES ($1,$2,$3,$4,$5,NULLIF($6,'')::date,$7,$8,$9)`,
+			wo2, b1, etype, title, detail, on, amount, source, property); err != nil {
+			panic(err)
+		}
+	}
+	ev("construction_photo", "东侧支架穿层锚固点照片（4 张）",
+		"支架就位后拍摄，穿层锚栓周边可见密封胶，但东侧收口与原卷材搭接宽度目测偏窄", "2026-06-18", nil, "施工单位-晨光新能源")
+	ev("waterproof_acceptance", "屋顶防水工程验收记录",
+		"2026-06-20 物业、施工方联合验收合格，蓄水试验无渗漏；验收范围注明'支架穿层节点五年质保'", "2026-06-20", nil, "阳光物业/晨光新能源")
+	ev("rainfall", "10 月 2 日降雨记录",
+		"18:00 至次日 06:00 持续强降雨，小时最大雨强 22mm/h，超过当年 9 月渗漏当日雨量", "2026-10-02", 68.5, "市气象局公开数据")
+	ev("consent", "顶层住户施工同意与漏水补偿备忘录",
+		"张伟 2026-03-11 已签署《屋顶光伏施工同意书》及《顶层漏水补偿备忘录》；住户主张备忘录只覆盖原方案支架，本次东侧加装支架未单独征询",
+		"2026-03-11", nil, "阳光物业存档")
+	act := func(atyp, content string, cost float64) {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO work_order_actions(work_order_id,building_id,action_type,content,cost,operator_id)
+			VALUES ($1,$2,$3,$4,$5,$6)`, wo2, b1, atyp, content, cost, property); err != nil {
+			panic(err)
+		}
+	}
+	act("temporary_seal", "10月3日上午屋面覆盖临时防水卷材并设置导流管，次卧摆放接水桶，滴水当日停止", 300)
+	act("resident_reassurance", "王经理上门安抚，说明检测与赔付流程，垫付酒店住宿 2 晚共 600 元（待责任认定后追偿）", 600)
+	act("third_party_inspection", "委托市建科院防水检测所对东侧穿层节点开孔检测，报告预计 5 个工作日出具", 1500)
+	// 维修期间冻结张伟名下相关组件（30%）自 10 月起的收益；待月结定稿挂账、责任确认后按比例释放
+	var fz int64
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO revenue_freezes(building_id,work_order_id,period_month,title,scope,created_by)
+		VALUES ($1,$2,'2026-10','东侧支架渗漏维修期间相关组件收益冻结','targeted',$3) RETURNING id`,
+		b1, wo2, property).Scan(&fz); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO freeze_targets(freeze_id,user_id) VALUES ($1,$2)`, fz, r1); err != nil {
+		return err
+	}
 	// 8 月结算：用结算引擎真实定稿，并同步台账/住户余额/收付款记录
 	if err := seedFinalizeAugust(ctx, tx, b1, property, r1, r2, r3); err != nil {
 		return err
